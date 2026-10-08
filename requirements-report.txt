@@ -1,0 +1,2 @@
+# Optional report generation only; application dependencies are unchanged.
+reportlab>=4.4,<5

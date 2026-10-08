@@ -4,6 +4,14 @@ from typing import Sequence
 from .grid import Cell
 
 
+@dataclass(frozen=True)
+class ReservationSnapshot:
+    timestep: int
+    vertices: frozenset[Cell]
+    terminal_goals: frozenset[Cell]
+    edges: tuple[tuple[Cell, Cell], ...]
+
+
 @dataclass
 class ReservationTable:
     """Edges are indexed by arrival time; terminal goals persist indefinitely."""
@@ -11,6 +19,14 @@ class ReservationTable:
     vertices: set[tuple[Cell, int]] = field(default_factory=set)
     edges: set[tuple[Cell, Cell, int]] = field(default_factory=set)
     terminal_goals: dict[Cell, int] = field(default_factory=dict)
+
+    def at_time(self, timestep: int) -> ReservationSnapshot:
+        if timestep < 0:
+            raise ValueError("Reservation timestep must be nonnegative.")
+        terminal = frozenset(cell for cell, arrival in self.terminal_goals.items() if timestep >= arrival)
+        vertices = frozenset(cell for cell, time in self.vertices if time == timestep) | terminal
+        edges = tuple(sorted((source, target) for source, target, time in self.edges if time == timestep))
+        return ReservationSnapshot(timestep, vertices, terminal, edges)
 
     def vertex_reserved(self, cell: Cell, timestep: int) -> bool:
         arrival = self.terminal_goals.get(cell)

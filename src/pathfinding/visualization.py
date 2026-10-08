@@ -4,11 +4,14 @@ from tkinter import messagebox, ttk
 from .astar import AStarSearch
 from .cooperative import CooperativePlanner
 from .demo_state import DemoState
-from .demos import conflict_demo
+from .decentralized import DCN
+from .decentralized_view import DecentralizedView
+from .demos import conflict_demo, promotion_demo
 from .grid import Cell, Grid
 from .heuristics import HEURISTICS
 from .multi_agent import IndependentPlanner, Simulation
-from .multi_agent_view import AGENT_COLORS, collision_message, draw_agents
+from .multi_agent_view import AGENT_COLORS, collision_message, draw_agents, draw_planning
+from .planning_view import advance_planning, rank_badges
 
 COLORS = {
     "Free": "#ffffff", "Obstacle": "#28323c", "Start": "#239b56",
@@ -23,8 +26,8 @@ class PathfindingApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("Robot Pathfinding: Single / Multi-Agent")
-        root.geometry("1100x850")
-        root.minsize(1000, 700)
+        root.geometry("1100x740")
+        root.minsize(950, 620)
         self.state = DemoState()
         self.multi_mode = tk.BooleanVar(value=False)
         self.mode_label = tk.StringVar(value="Multi-Agent Mode: OFF")
@@ -37,6 +40,15 @@ class PathfindingApp:
         self.probability = tk.StringVar(value="0.25")
         self.seed = tk.StringVar(value="42")
         self.heuristic = tk.StringVar(value="Manhattan")
+        self._previous_heuristic: str | None = None
+        self.playback = tk.StringVar(value="Agent")
+        self.verbosity = tk.StringVar(value="Summary")
+        self.show_priorities = tk.BooleanVar(value=True)
+        self.show_reservations = tk.BooleanVar(value=False)
+        self.reservation_time = tk.StringVar(value="Auto")
+        self.planning_phase = tk.StringVar(value="Ready")
+        self.priority_order = tk.StringVar(value="Priority: pending analysis")
+        self.reservation_caption = tk.StringVar(value="Reservations: current arrival timestep")
         self.delay = tk.DoubleVar(value=50)
         self.stats = tk.StringVar()
         self.running = False
@@ -60,8 +72,8 @@ class PathfindingApp:
         self.randomize_button = ttk.Button(modes, text="Randomize agents", command=self.randomize_agents, state="disabled")
         self.randomize_button.pack(side="left", padx=8)
         ttk.Label(modes, text="Algorithm").pack(side="left", padx=5)
-        self.algorithm_selector = ttk.Combobox(modes, textvariable=self.algorithm, values=["Independent A*", "CG-ST-A*"],
-                                               width=18, state="disabled")
+        self.algorithm_selector = ttk.Combobox(modes, textvariable=self.algorithm, values=["Independent A*", "CG-ST-A*", DCN],
+                                               width=36, state="disabled")
         self.algorithm_selector.pack(side="left")
         self.algorithm_selector.bind("<<ComboboxSelected>>", lambda event: self.switch_algorithm())
         ttk.Button(modes, text="Load Conflict Demo", command=self.load_conflict_demo).pack(side="left", padx=8)
@@ -90,9 +102,17 @@ class PathfindingApp:
         ttk.Scale(controls, from_=10, to=1000, variable=self.delay, length=130).pack(side="left")
         ttk.Label(controls, text="slow").pack(side="left", padx=3)
 
-        self.canvas = tk.Canvas(root, background="#f4f4f4", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, padx=8)
+        self.panes = ttk.Panedwindow(root, orient="horizontal")
+        self.panes.pack(fill="both", expand=True, padx=8)
+        board = ttk.Frame(self.panes)
+        self.panes.add(board, weight=3)
+        self.canvas = tk.Canvas(board, background="#f4f4f4", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda event: self.draw_grid())
+        self.explanation = ttk.Frame(self.panes, padding=(8, 0), width=330, height=300)
+        self.explanation.pack_propagate(False)
+        self._build_explanation()
+        self.decentralized_view = DecentralizedView(self)
         self.legend = ttk.Frame(root, padding=8)
         self.legend.pack(fill="x")
         ttk.Label(root, textvariable=self.stats, padding=(8, 0, 8, 8), justify="left", wraplength=1050).pack(fill="x")
@@ -105,6 +125,91 @@ class PathfindingApp:
         self.refresh_mode_controls()
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.generate()
+
+    def _build_explanation(self) -> None:
+        panel = self.explanation
+        ttk.Label(panel, textvariable=self.planning_phase, font=("Arial", 11, "bold")).pack(anchor="w")
+        ttk.Label(panel, textvariable=self.priority_order, wraplength=310).pack(anchor="w", pady=4)
+        ttk.Label(panel, text="Rank: (-C, -B, -L, Agent ID)",
+                  wraplength=310).pack(anchor="w")
+        columns = ("agent", "conflicts", "bottlenecks", "cost", "initial", "current")
+        table_frame = ttk.Frame(panel)
+        table_frame.pack(fill="x", pady=4)
+        self.priority_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=4)
+        for column, label in zip(columns, ("Agent", "C", "B", "L", "Initial", "Rank")):
+            self.priority_table.heading(column, text=label)
+            self.priority_table.column(column, width=48, minwidth=35, anchor="center", stretch=True)
+        self.priority_table.tag_configure("active", background="#fff0ba")
+        self.priority_table.pack(side="left", fill="x", expand=True)
+        table_scroll = ttk.Scrollbar(table_frame, command=self.priority_table.yview)
+        table_scroll.pack(side="right", fill="y")
+        self.priority_table.configure(yscrollcommand=table_scroll.set)
+        ttk.Label(panel, text="C: conflicts; B: low-degree path cells; L: cost", wraplength=310).pack(anchor="w")
+        settings = ttk.Frame(panel)
+        settings.pack(fill="x")
+        ttk.Label(settings, text="Playback").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(settings, textvariable=self.playback, values=("Agent", "Detailed"), state="readonly", width=10).grid(row=0, column=1)
+        ttk.Label(settings, text="Log").grid(row=0, column=2, padx=4)
+        ttk.Combobox(settings, textvariable=self.verbosity, values=("Summary", "Detailed"), state="readonly", width=9).grid(row=0, column=3)
+        toggles = ttk.Frame(panel)
+        toggles.pack(fill="x")
+        ttk.Checkbutton(toggles, text="Show Priorities", variable=self.show_priorities, command=self.draw_multi).pack(side="left")
+        ttk.Checkbutton(toggles, text="Show Reservations", variable=self.show_reservations, command=self.refresh_explanation).pack(side="left")
+        times = ttk.Frame(panel)
+        times.pack(fill="x")
+        ttk.Label(times, text="Reservation t").pack(side="left")
+        self.time_input = ttk.Combobox(times, textvariable=self.reservation_time, values=("Auto",), width=8)
+        self.time_input.pack(side="left", padx=5)
+        self.time_input.bind("<<ComboboxSelected>>", lambda event: self.refresh_explanation())
+        self.time_input.bind("<Return>", lambda event: self.refresh_explanation())
+        ttk.Label(panel, textvariable=self.reservation_caption, wraplength=310).pack(anchor="w", pady=3)
+        ttk.Label(panel, text="Blue: frontier (≤256); orange: state/rejected swap\nTeal: timed reservations; purple: held goals",
+                  wraplength=310).pack(anchor="w")
+        ttk.Button(panel, text="Load Promotion Demo (seed 156)", command=self.load_promotion_demo).pack(fill="x", pady=4)
+        ttk.Label(panel, text="Planning events (last 300 lines)").pack(anchor="w")
+        log = ttk.Frame(panel)
+        log.pack(fill="both", expand=True)
+        self.planning_events = tk.Text(log, height=4, width=37, wrap="word", state="disabled", font=("Arial", 9))
+        self.planning_events.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(log, command=self.planning_events.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.planning_events.configure(yscrollcommand=scrollbar.set)
+
+    def refresh_explanation(self) -> None:
+        planner = self.state.cooperative
+        if planner:
+            selected = self.reservation_time.get()
+            try:
+                time = None if selected == "Auto" else max(0, int(selected))
+            except ValueError:
+                self.reservation_time.set("Auto")
+                time = None
+            snapshot = planner.snapshot(time)
+            self.state.planning_snapshot = snapshot
+            phase = ("Complete" if self.state.simulation.done else "Executing") if self.state.simulation else snapshot.phase
+            self.planning_phase.set(f"Phase: {phase} | Attempt {snapshot.attempt}")
+            self.priority_order.set("Priority: " + (" → ".join(f"A{i}" for i in snapshot.order) or "pending analysis"))
+            self.priority_table.delete(*self.priority_table.get_children())
+            self.priority_table.configure(height=min(4, len(snapshot.priorities)))
+            for row in sorted(snapshot.priorities, key=lambda r: (r.current_rank or 999, r.agent_id)):
+                values = (row.agent_id, row.conflict_load, row.bottleneck_exposure, row.path_cost, row.initial_rank, row.current_rank)
+                self.priority_table.insert("", "end", iid=str(row.agent_id), values=tuple("—" if v is None else v for v in values),
+                                           tags=("active",) if row.agent_id == snapshot.agent_id else ())
+            if snapshot.agent_id is not None:
+                self.priority_table.see(str(snapshot.agent_id))
+            self.reservation_caption.set(f"Arrival t={snapshot.reservations.timestep}; goal holds persist. Spatial overlap ≠ collision.")
+            self.time_input.configure(values=("Auto", *range(min(100, planner.maximum_horizon_used) + 2)))
+        else:
+            self.priority_table.delete(*self.priority_table.get_children())
+            self.planning_phase.set("Phase: Ready")
+            self.priority_order.set("Priority: pending analysis")
+        self.planning_events.configure(state="normal")
+        self.planning_events.delete("1.0", "end")
+        self.planning_events.insert("end", "\n".join(self.state.planning_log.lines))
+        self.planning_events.configure(state="disabled")
+        self.planning_events.see("end")
+        if self.state.multi_agent:
+            self.draw_multi()
 
     @property
     def grid(self) -> Grid | None:
@@ -142,12 +247,30 @@ class PathfindingApp:
 
     def refresh_mode_controls(self) -> None:
         enabled = self.state.multi_agent
+        cooperative = enabled and self.state.algorithm == "CG-ST-A*"
+        decentralized = enabled and self.state.algorithm == DCN
+        coordinated = cooperative or decentralized
+        if coordinated and self._previous_heuristic is None:
+            self._previous_heuristic = self.heuristic.get()
+            self.heuristic.set("Manhattan")
+        elif not coordinated and self._previous_heuristic is not None:
+            self.heuristic.set(self._previous_heuristic)
+            self._previous_heuristic = None
+        if cooperative and str(self.explanation) not in self.panes.panes():
+            self.panes.add(self.explanation, weight=1)
+        elif not cooperative and str(self.explanation) in self.panes.panes():
+            self.panes.forget(self.explanation)
+        panel = self.decentralized_view.frame
+        if decentralized and str(panel) not in self.panes.panes():
+            self.panes.add(panel, weight=1)
+        elif not decentralized and str(panel) in self.panes.panes():
+            self.panes.forget(panel)
         self.mode_label.set(f"Multi-Agent Mode: {'ON' if enabled else 'OFF'}")
         self.agent_input.configure(state="normal" if enabled else "disabled")
         self.randomize_button.configure(state="normal" if enabled else "disabled")
         self.algorithm_selector.configure(state="readonly" if enabled else "disabled")
-        self.heuristic_selector.configure(state="disabled" if enabled and self.state.algorithm == "CG-ST-A*" else "readonly")
-        if enabled:
+        self.heuristic_selector.configure(state="disabled" if coordinated else "readonly")
+        if enabled and not coordinated:
             self.events_frame.pack(fill="x", padx=8, pady=(0, 8))
         else:
             self.events_frame.pack_forget()
@@ -192,6 +315,21 @@ class PathfindingApp:
         self.refresh_mode_controls()
         self.reset()
 
+    def load_promotion_demo(self) -> None:
+        self.pause()
+        self.state.grid, self.state.agents = promotion_demo()
+        self.state.multi_agent = True
+        self.state.set_algorithm("CG-ST-A*")
+        self.algorithm.set("CG-ST-A*")
+        self.multi_mode.set(True)
+        self.width.set("10")
+        self.height.set("10")
+        self.probability.set("0.3")
+        self.seed.set("156")
+        self.agent_count.set("8")
+        self.refresh_mode_controls()
+        self.reset()
+
     def generate(self, next_seed: bool = False) -> None:
         self.pause()
         try:
@@ -225,6 +363,9 @@ class PathfindingApp:
         self.current = None
         self.status = "Ready"
         self.events.delete(0, "end")
+        self.reservation_time.set("Auto")
+        self.decentralized_view.reset()
+        self.refresh_explanation()
         self.draw_grid()
         self.update_stats()
 
@@ -235,7 +376,8 @@ class PathfindingApp:
         self.pending_step = False
         if ((self.search is not None and self.search.result is not None)
                 or (self.state.simulation is not None and self.state.simulation.done)
-                or (self.state.cooperative is not None and self.state.cooperative.done and self.state.simulation is None)):
+                or (self.state.cooperative is not None and self.state.cooperative.done and self.state.simulation is None)
+                or (self.state.decentralized is not None and self.state.decentralized.done and self.state.simulation is None)):
             self.reset()
         self.running = True
         self.status = "Running"
@@ -247,6 +389,7 @@ class PathfindingApp:
         self.pending_step = False
         if ((self.search is not None and self.search.result is None)
                 or (self.state.cooperative is not None and not self.state.cooperative.done)
+                or (self.state.decentralized is not None and not self.state.decentralized.done)
                 or (self.state.simulation is not None and not self.state.simulation.done)
                 or (self.state.multi_agent and self.state.planner is not None
                     and (self.state.simulation is None or not self.state.simulation.done))):
@@ -268,7 +411,8 @@ class PathfindingApp:
         self._advance()
         if self.running or self.pending_step:
             planning = self.state.multi_agent and self.state.simulation is None
-            self.timer = self.root.after(1 if planning else max(1, int(self.delay.get())), self._tick)
+            quick = planning and (self.state.algorithm not in ("CG-ST-A*", DCN) or self.pending_step)
+            self.timer = self.root.after(1 if quick else max(1, int(self.delay.get())), self._tick)
 
     def _advance(self) -> None:
         if self.state.multi_agent:
@@ -305,6 +449,9 @@ class PathfindingApp:
         self.update_stats()
 
     def _advance_multi(self) -> None:
+        if self.state.algorithm == DCN:
+            self.decentralized_view.advance()
+            return
         if self.state.algorithm == "CG-ST-A*":
             self._advance_cooperative()
             return
@@ -335,14 +482,21 @@ class PathfindingApp:
         if self.grid is None:
             return
         if self.state.cooperative is None:
-            self.state.cooperative = CooperativePlanner(self.grid, self.state.agents)
+            self.state.cooperative = CooperativePlanner(self.grid, self.state.agents, observe=True)
         planner = self.state.cooperative
-        for _ in range(100):
-            if planner.done:
-                break
-            planner.step()
+        if self.state.simulation is not None:
+            self._execute_simulation()
+            self.refresh_explanation()
+            return
+        unit_complete = advance_planning(planner, self.playback.get() == "Detailed")
+        for event in planner.drain_events():
+            self.state.planning_log.append(event, self.verbosity.get() == "Detailed")
+        if unit_complete:
+            self.pending_step = False
+        self.refresh_explanation()
         if not planner.done:
-            self.status = planner.phase
+            snapshot = self.state.planning_snapshot
+            self.status = snapshot.phase + (f" Agent {snapshot.agent_id}" if snapshot.agent_id is not None else "")
             self.update_stats()
             return
         if not planner.result.found:
@@ -352,7 +506,11 @@ class PathfindingApp:
             return
         if self.state.simulation is None:
             self.state.simulation = Simulation(planner.result.paths)
-        self._execute_simulation()
+            self.state.planning_log.lines.append("[Execution] All coordinated paths ready; t=0. Next step advances one timestep.")
+        self.status = "Executing: paths ready"
+        self.pending_step = False
+        self.refresh_explanation()
+        self.update_stats()
 
     def _execute_simulation(self) -> None:
         simulation = self.state.simulation
@@ -360,21 +518,46 @@ class PathfindingApp:
         self.pending_step = False
         if simulation.done:
             self.running = False
-            self.status = "Execution complete" if self.state.algorithm == "CG-ST-A*" else "Execution complete (collisions are not resolved)"
+            self.status = "Execution complete" if self.state.algorithm in ("CG-ST-A*", DCN) else "Execution complete (collisions are not resolved)"
         else:
             self.status = "Running" if self.running else "Paused"
         while self.events.size() < len(simulation.collisions):
             self.events.insert("end", collision_message(simulation.collisions[self.events.size()]))
         self.events.yview_moveto(1)
+        if self.state.algorithm == "CG-ST-A*":
+            waits = [agent_id for agent_id in simulation.paths
+                     if 0 < simulation.timestep < len(simulation.paths[agent_id])
+                     and simulation.paths[agent_id][simulation.timestep] == simulation.paths[agent_id][simulation.timestep - 1]]
+            self.state.planning_log.lines.append(f"[Execution] t={simulation.timestep}" + (f"; WAIT agents {waits}" if waits else ""))
+            for event in simulation.current_collisions:
+                self.state.planning_log.lines.append("[Collision] " + collision_message(event))
         self.draw_multi()
         self.update_stats()
 
     def draw_multi(self) -> None:
         simulation = self.state.simulation
         paths = simulation.paths if simulation else {}
+        snapshot = self.state.planning_snapshot if self.state.algorithm == "CG-ST-A*" else None
+        if snapshot and not simulation:
+            paths = dict(snapshot.paths) if snapshot.order else dict(snapshot.independent_paths)
+        decentralized = self.state.decentralized if self.state.algorithm == DCN else None
+        if decentralized and not simulation:
+            paths = {i: c.path for i, c in decentralized.controllers.items() if c.path}
         positions = simulation.positions if simulation else {agent.agent_id: agent.start for agent in self.state.agents}
         collisions = simulation.current_collisions if simulation else ()
-        draw_agents(self.canvas, self.state.agents, paths, positions, collisions, *self.draw_geometry)
+        if snapshot and snapshot.phase == "Ranking" and snapshot.attempt == 1:
+            collisions = snapshot.predicted_conflicts
+        if decentralized and not simulation:
+            collisions = tuple(dict.fromkeys(event for c in decentralized.controllers.values() for event in c.local_conflicts))
+        priorities = rank_badges(snapshot.priorities) if snapshot and self.show_priorities.get() else None
+        draw_agents(self.canvas, self.state.agents, paths, positions, collisions, *self.draw_geometry, priorities=priorities)
+        if snapshot and not simulation:
+            draw_planning(self.canvas, snapshot, self.show_reservations.get(), *self.draw_geometry)
+        else:
+            self.canvas.delete("planning")
+        self.canvas.delete("communication")
+        if self.state.algorithm == DCN:
+            self.decentralized_view.draw_links(positions)
 
     def color(self, cell: Cell) -> str:
         if self.grid is None:
@@ -442,6 +625,9 @@ class PathfindingApp:
         )
 
     def update_multi_stats(self) -> None:
+        if self.state.algorithm == DCN:
+            self.decentralized_view.update_stats()
+            return
         if self.state.algorithm == "CG-ST-A*":
             self.update_cooperative_stats()
             return
@@ -467,7 +653,9 @@ class PathfindingApp:
         if result is None:
             order = planner.order if planner else ()
             priority = ' → '.join(map(str, order)) if order else 'pending independent analysis'
-            self.stats.set(f"{first}\nPriority: {priority}")
+            current = self.state.planning_snapshot.current if self.state.planning_snapshot else None
+            self.stats.set(f"{first}\nPriority: {priority} | Attempts: {len(planner.attempted_orders) if planner else 0} | "
+                           f"Promotions: {planner.priority_promotions if planner else 0} | Current search state: {current or '—'}")
             return
         priority = ' → '.join(map(str, result.final_priority_order))
         details = (f"Priority: {priority} | Attempts: {result.planning_attempts} | Promotions: {result.priority_promotions} | "

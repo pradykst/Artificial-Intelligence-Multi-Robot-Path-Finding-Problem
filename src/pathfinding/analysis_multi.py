@@ -8,6 +8,7 @@ from .collisions import Paths, detect_collisions
 
 INDEPENDENT = "Independent A*"
 FIXED = "Fixed-Priority ST-A*"
+NO_PROMOTION = "Conflict-Guided ST-A* (no promotion)"
 PROPOSED = "CG-ST-A*"
 IDENTITY = ("scenario_id", "seed", "scenario_hash", "width", "height", "obstacle_probability", "number_of_agents")
 HARDNESS = ("independent_total_collisions", "independent_vertex_collisions", "independent_edge_collisions",
@@ -37,10 +38,12 @@ def independent_hardness(paths: Paths | None) -> dict:
     }
 
 
-def validate_paired_rows(rows: Sequence[dict]) -> dict[str, dict[str, dict]]:
+def validate_paired_rows(
+    rows: Sequence[dict], expected_algorithms: Sequence[str] | None = None,
+) -> dict[str, dict[str, dict]]:
     """Reject duplicate/missing method rows and mismatched scenario identities."""
     groups: dict[str, dict[str, dict]] = {}
-    algorithms = {row["algorithm"] for row in rows}
+    algorithms = set(expected_algorithms) if expected_algorithms is not None else {row["algorithm"] for row in rows}
     for row in rows:
         group = groups.setdefault(row["scenario_id"], {})
         algorithm = row["algorithm"]
@@ -51,10 +54,13 @@ def validate_paired_rows(rows: Sequence[dict]) -> dict[str, dict[str, dict]]:
             for field in (*IDENTITY, *HARDNESS):
                 if row[field] != reference[field] and not (missing(row[field]) and missing(reference[field])):
                     raise ValueError(f"Scenario mismatch for {row['scenario_id']}: {field}")
+            for field in ("trial", "generation_attempts"):
+                if row.get(field) != reference.get(field):
+                    raise ValueError(f"Scenario mismatch for {row['scenario_id']}: {field}")
         group[algorithm] = row
     for scenario_id, group in groups.items():
         if set(group) != algorithms:
-            raise ValueError(f"Missing algorithm row for {scenario_id}")
+            raise ValueError(f"Missing algorithm row or unexpected method for {scenario_id}")
     return groups
 
 
@@ -160,10 +166,14 @@ def summarize_methods(rows: Sequence[dict], *, subset_only: bool = False) -> lis
                       "collision_free_count": safe, "collision_free_denominator": count,
                       "collision_free_rate": safe / count if count else None,
                       "coordinated_failure_count": count - successes}
-            for metric in ("sum_of_costs", "makespan", "wait_actions", "expanded_states", "generated_states", "elapsed_ms"):
-                values = [row[metric] for row in selected if metric not in ("sum_of_costs", "makespan", "wait_actions")
+            for metric in ("sum_of_costs", "makespan", "wait_actions", "expanded_states", "generated_states", "elapsed_ms",
+                           "vertex_collisions", "edge_collisions", "failed_planning_attempts", "planning_attempts", "priority_promotions"):
+                values = [row.get(metric) for row in selected if metric not in ("sum_of_costs", "makespan", "wait_actions")
                           or row["coordinated_planning_success"]]
                 _add_statistics(result, metric, values)
+            for metric in ("vertex_collisions", "edge_collisions", "failed_planning_attempts", "planning_attempts", "priority_promotions"):
+                values = [row.get(metric) for row in selected if not missing(row.get(metric))]
+                result[f"{metric}_total"] = sum(values) if values else None
             summaries.append(result)
     return summaries
 

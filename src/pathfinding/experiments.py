@@ -3,6 +3,8 @@ import csv
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
+from itertools import combinations
+from math import isnan
 from pathlib import Path
 import platform
 from statistics import mean, median, stdev
@@ -13,6 +15,9 @@ from .grid import Grid
 from .heuristics import HEURISTICS, REQUIRED_HEURISTICS
 
 METRICS = ("path_cost", "expanded_nodes", "generated_nodes", "peak_frontier_size", "elapsed_ms")
+IDENTITY = ("instance_id", "grid_hash", "trial", "seed", "width", "height",
+            "obstacle_probability", "obstacle_count", "generation_attempts",
+            "start_x", "start_y", "goal_x", "goal_y")
 
 
 @dataclass(frozen=True)
@@ -88,6 +93,8 @@ def generate_instances(
 
 def run_benchmark(instances: Sequence[Instance], include_zero: bool = False) -> list[dict]:
     """Run every selected heuristic on each immutable instance and verify costs."""
+    if len({item.instance_id for item in instances}) != len(instances):
+        raise ValueError("Instance IDs must be unique within a benchmark.")
     heuristics = HEURISTICS if include_zero else REQUIRED_HEURISTICS
     names = list(heuristics)
     rows = []
@@ -119,6 +126,67 @@ def run_benchmark(instances: Sequence[Instance], include_zero: bool = False) -> 
     return rows
 
 
+def validate_paired_rows(
+    rows: Sequence[dict], expected_heuristics: Sequence[str] | None = None,
+) -> dict[str, dict[str, dict]]:
+    """Check complete pairs and identity before reporting or saving results."""
+    names = set(expected_heuristics) if expected_heuristics is not None else {r["heuristic"] for r in rows}
+    groups: dict[str, dict[str, dict]] = {}
+    for row in rows:
+        group = groups.setdefault(row["instance_id"], {})
+        name = row["heuristic"]
+        if name in group:
+            raise ValueError(f"Duplicate row for {row['instance_id']}: {name}")
+        if group:
+            reference = next(iter(group.values()))
+            if any(row[field] != reference[field] for field in IDENTITY):
+                raise ValueError(f"Scenario mismatch for {row['instance_id']}.")
+        group[name] = row
+    for instance_id, group in groups.items():
+        if set(group) != names:
+            raise ValueError(f"Missing or unexpected heuristic row for {instance_id}.")
+    return groups
+
+
+def missing(value) -> bool:
+    return value is None or isinstance(value, float) and isnan(value)
+
+
+def metric_statistics(values: Sequence) -> dict:
+    values = [value for value in values if not missing(value)]
+    return {"count": len(values), "mean": mean(values) if values else None,
+            "median": median(values) if values else None,
+            "stdev": stdev(values) if len(values) > 1 else (0.0 if values else None),
+            "min": min(values) if values else None, "max": max(values) if values else None}
+
+
+def paired_comparisons(rows: Sequence[dict]) -> list[dict]:
+    """Expanded-node differences are A minus B, aligned by verified instance ID."""
+    pairs = []
+    for group in validate_paired_rows(rows).values():
+        names = [name for name in HEURISTICS if name in group]
+        for name_a, name_b in combinations(names, 2):
+            a, b = group[name_a], group[name_b]
+            av, bv = a["expanded_nodes"], b["expanded_nodes"]
+            pairs.append({**{field: a[field] for field in IDENTITY},
+                          "heuristic_a": name_a, "heuristic_b": name_b,
+                          "both_found": a["found"] and b["found"],
+                          "expanded_nodes_a": av, "expanded_nodes_b": bv,
+                          "delta_expanded_nodes": av - bv if not missing(av) and not missing(bv) else None})
+    return pairs
+
+
+def summarize_pairs(pairs: Sequence[dict]) -> list[dict]:
+    groups: dict[tuple, list[dict]] = {}
+    fields = ("width", "height", "obstacle_probability", "heuristic_a", "heuristic_b")
+    for pair in pairs:
+        groups.setdefault(tuple(pair[field] for field in fields), []).append(pair)
+    return [{**dict(zip(fields, key)), "paired_trials": len(group),
+             **{f"delta_expanded_nodes_{stat}": value for stat, value in
+                metric_statistics([pair["delta_expanded_nodes"] for pair in group]).items()}}
+            for key, group in groups.items()]
+
+
 def summarize(rows: Sequence[dict]) -> list[dict]:
     groups: dict[tuple, list[dict]] = {}
     for row in rows:
@@ -129,14 +197,11 @@ def summarize(rows: Sequence[dict]) -> list[dict]:
         summary = {
             "width": width, "height": height, "obstacle_probability": probability,
             "heuristic": name, "runs": len(group), "found_count": sum(row["found"] for row in group),
+            "success_rate": sum(row["found"] for row in group) / len(group),
         }
         for metric in METRICS:
-            values = [row[metric] for row in group]
-            summary.update({
-                f"{metric}_mean": mean(values), f"{metric}_median": median(values),
-                f"{metric}_stdev": stdev(values) if len(values) > 1 else 0.0,
-                f"{metric}_min": min(values), f"{metric}_max": max(values),
-            })
+            summary.update({f"{metric}_{stat}": value for stat, value in
+                            metric_statistics([row[metric] for row in group]).items()})
         summaries.append(summary)
     return summaries
 
@@ -167,19 +232,24 @@ def plot_results(summaries: Sequence[dict], output: Path) -> list[Path]:
             ("Expanded nodes", "Search time (ms)", "Peak unique frontier size"),
         ):
             positions = list(range(len(group)))
-            axis.bar([x - 0.19 for x in positions], [r[f"{metric}_mean"] for r in group],
+            means = [r[f"{metric}_mean"] if r[f"{metric}_mean"] is not None else float("nan") for r in group]
+            medians = [r[f"{metric}_median"] if r[f"{metric}_median"] is not None else float("nan") for r in group]
+            axis.bar([x - 0.19 for x in positions], means,
                      width=0.38, label="Mean", color="#3178a8")
-            axis.bar([x + 0.19 for x in positions], [r[f"{metric}_median"] for r in group],
+            axis.bar([x + 0.19 for x in positions], medians,
                      width=0.38, label="Median", color="#e0a34a")
             axis.set_xticks(positions, [r["heuristic"].replace(" / ", "\n") for r in group], rotation=20)
             axis.set_ylabel(label)
-            maximum = max(r[f"{metric}_{stat}"] for r in group for stat in ("mean", "median"))
+            maximum = max((r[f"{metric}_{stat}"] for r in group for stat in ("mean", "median")
+                           if r[f"{metric}_{stat}"] is not None), default=0)
             axis.set_ylim(0, maximum * 1.25 if maximum else 1)
             axis.grid(axis="y", alpha=0.25)
             axis.set_axisbelow(True)
             axis.legend(loc="upper left")
+            if metric == "elapsed_ms":
+                axis.set_title("Descriptive timing; tiny differences are noisy", fontsize=9)
         count_text = ", ".join(f"{r['heuristic']}: {r['runs']}" for r in group)
-        fig.suptitle(f"{width} × {height}, obstacle probability {probability:g}\nRuns — {count_text}")
+        fig.suptitle(f"{width} × {height}, obstacle probability {probability:g}\nPaired trial counts — {count_text}")
         filename = output / f"comparison_{width}x{height}_p{probability:g}.png"
         fig.savefig(filename, dpi=160)
         plt.close(fig)
@@ -190,14 +260,41 @@ def plot_results(summaries: Sequence[dict], output: Path) -> list[Path]:
 def save_results(
     instances: Sequence[Instance], rows: Sequence[dict], output: Path, configuration: dict,
 ) -> list[Path]:
+    if not instances or not rows:
+        raise ValueError("Provide nonempty instances and result rows.")
+    expected = (list(HEURISTICS if configuration["include_zero"] else REQUIRED_HEURISTICS)
+                if "include_zero" in configuration else None)
+    groups = validate_paired_rows(rows, expected)
+    instance_ids = {item.instance_id for item in instances}
+    if len(instance_ids) != len(instances) or set(groups) != instance_ids:
+        raise ValueError("Result instance IDs do not match the instance manifest.")
+    for instance in instances:
+        group = groups[instance.instance_id]
+        row = next(iter(group.values()))
+        grid = instance.grid
+        identity = (instance.instance_id, grid_hash(grid), instance.trial, instance.seed,
+                    grid.width, grid.height, instance.obstacle_probability, len(grid.obstacles),
+                    instance.attempts, *grid.start, *grid.goal)
+        if tuple(row[field] for field in IDENTITY) != identity:
+            raise ValueError(f"Result identity does not match instance {instance.instance_id}.")
+        if (any(not r["found"] or missing(r["path_cost"]) for r in group.values())
+                or len({r["path_cost"] for r in group.values()}) != 1):
+            raise ValueError(f"Successful equal path costs required for solvable instance {instance.instance_id}.")
     output.mkdir(parents=True, exist_ok=True)
     summaries = summarize(rows)
     write_csv(output / "raw_results.csv", rows)
     write_csv(output / "summary.csv", summaries)
+    pairs = paired_comparisons(rows)
+    if pairs:
+        write_csv(output / "paired_comparisons.csv", pairs)
+        write_csv(output / "paired_summary.csv", summarize_pairs(pairs))
     manifest = {
         "configuration": configuration, "python": platform.python_version(),
         "platform": platform.platform(), "path_costs_verified_equal": True,
         "accepted_instances": len(instances),
+        "seed_policy": "One global candidate seed counter from base_seed; increment after every draw, including rejections.",
+        "sampling_policy": "Conditional on start-goal reachability; no heuristic-specific sampling.",
+        "heuristics": list(next(iter(groups.values()))) if groups else [],
         "rejected_candidates": sum(instance.attempts - 1 for instance in instances),
         "instances": [
             {"instance_id": item.instance_id, "seed": item.seed, "trial": item.trial,
@@ -214,7 +311,9 @@ def save_results(
         "Verified identical path costs across all selected heuristics on every instance.",
         "Expanded nodes are the primary algorithmic performance metric.",
         "Runtime varies with machine load; use repeated trials and descriptive statistics.",
-        "Summary CSV includes mean, median, sample standard deviation, minimum and maximum.",
+        "Summary CSV includes success rates, per-metric counts, mean, median, sample standard deviation, minimum and maximum.",
+        "Paired expanded-node differences use heuristic A minus B on the same scenario.",
+        "Sub-millisecond runtime differences alone do not establish performance superiority.",
     ]
     (output / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return plots
@@ -237,7 +336,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--probabilities", type=float, nargs="+", default=[0.25])
     parser.add_argument("--base-seed", type=int, default=42)
     parser.add_argument("--max-attempts", type=int, default=1000, help="Maximum draws per accepted map")
-    parser.add_argument("--include-zero", action="store_true", help="Also run the optional Dijkstra baseline")
+    parser.add_argument("--include-zero", action="store_true", default=True,
+                        help="Compatibility flag: Zero / Dijkstra is now included by default")
     parser.add_argument("--output", type=Path, default=Path("results"))
     args = parser.parse_args(argv)
     try:

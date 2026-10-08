@@ -65,12 +65,14 @@ def plot_analysis(rows: Sequence[dict], pairs: Sequence[dict], output: Path) -> 
         success_rates(axes[0], group, counts, "All generated scenarios")
         success_rates(axes[1], contended, counts, "Independent A* had >=1 conflict")
         cg = [row for row in group if row["algorithm"] == PROPOSED]
+        trial_text = "; ".join(f"{count} agents: {sum(row['number_of_agents'] == count for row in cg)}" for count in counts)
+        title = f"{width} × {height}, obstacle probability {probability:g}; trials — {trial_text}"
         distribution(axes[2], cg, "priority_promotions", counts, "CG priority promotions")
         largest = max((row["priority_promotions"] for row in cg if not missing(row["priority_promotions"])), default=0)
         axes[2].set_ylim(-0.05, max(1, largest) * 1.1)
         axes[2].set_title("CG adaptation activity (all runs)")
         axes[2].legend(fontsize=8)
-        fig.suptitle(f"{width} × {height}, obstacle probability {probability:g} — outcomes and adaptation")
+        fig.suptitle(f"{title}\nOutcomes and adaptation; subset counts are shown on axes")
         filename = output / f"coordination_{width}x{height}_p{probability:g}.png"
         fig.savefig(filename, dpi=150)
         plt.close(fig)
@@ -83,7 +85,7 @@ def plot_analysis(rows: Sequence[dict], pairs: Sequence[dict], output: Path) -> 
                                        ("SOC: CG − Fixed", "Makespan: CG − Fixed", "Expanded states: CG − Fixed")):
             distribution(axis, paired, metric, counts, label)
         axes[0].legend(fontsize=8)
-        fig.suptitle(f"{width} × {height}, obstacle probability {probability:g}\n"
+        fig.suptitle(f"{title}\n"
                      "Both methods successful only; each dot is one scenario. Negative differences mean a lower CG value.")
         filename = output / f"paired_{width}x{height}_p{probability:g}.png"
         fig.savefig(filename, dpi=150)

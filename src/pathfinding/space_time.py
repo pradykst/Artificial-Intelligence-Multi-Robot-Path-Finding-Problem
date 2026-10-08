@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from heapq import heappop, heappush
 from itertools import count
+from itertools import islice
 from time import perf_counter_ns
 
 from .grid import Cell, Grid
@@ -8,6 +9,21 @@ from .heuristics import Heuristic, manhattan
 from .reservations import ReservationTable
 
 TimedState = tuple[Cell, int]
+
+
+@dataclass(frozen=True)
+class RejectedMove:
+    source: Cell
+    target: Cell
+    arrival: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class SearchObservation:
+    expanded: TimedState | None
+    opened: tuple[TimedState, ...]
+    rejected: tuple[RejectedMove, ...]
 
 
 @dataclass(frozen=True)
@@ -28,6 +44,7 @@ class SpaceTimeSearch:
     def __init__(
         self, grid: Grid, start: Cell, goal: Cell, reservations: ReservationTable,
         horizon: int, heuristic: Heuristic = manhattan, max_expansions: int = 100_000,
+        *, observe: bool = False,
     ) -> None:
         began = perf_counter_ns()
         if horizon < 0 or max_expansions < 1:
@@ -46,8 +63,13 @@ class SpaceTimeSearch:
         self.expanded_states = self.generated_states = 0
         self.peak_frontier_size = 1
         self._cutoff = False
+        self.observe = observe
+        self.last_observation: SearchObservation | None = None
         self.result: SpaceTimeResult | None = None
         self._elapsed_ns = perf_counter_ns() - began
+
+    def frontier(self, limit: int = 256) -> tuple[TimedState, ...]:
+        return tuple(islice(self._open, limit))
 
     def _path(self, state: TimedState) -> tuple[Cell, ...]:
         cells = [state[0]]
@@ -62,6 +84,9 @@ class SpaceTimeSearch:
         began = perf_counter_ns()
         path: tuple[Cell, ...] = ()
         reason = None
+        expanded = None
+        opened = []
+        rejected = []
         if self.reservations.vertex_reserved(self.start, 0):
             reason = "start_reserved"
         elif self.goal in self.reservations.terminal_goals:
@@ -78,14 +103,20 @@ class SpaceTimeSearch:
                 del self._open[state]
                 self.expanded_states += 1
                 cell, timestep = state
+                expanded = state
                 if cell == self.goal and self.reservations.can_hold_goal(cell, timestep):
                     path = self._path(state)
                     break
                 for neighbor in (*self.grid.neighbors(cell), cell):
                     arrival = timestep + 1
                     if not self.reservations.allows(cell, neighbor, arrival):
+                        if self.observe:
+                            rejection = "vertex reservation" if self.reservations.vertex_reserved(neighbor, arrival) else "edge-swap reservation"
+                            rejected.append(RejectedMove(cell, neighbor, arrival, rejection))
                         continue
                     if neighbor == self.goal and not self.reservations.can_hold_goal(neighbor, arrival):
+                        if self.observe:
+                            rejected.append(RejectedMove(cell, neighbor, arrival, "future goal reservation"))
                         continue
                     if arrival > self.horizon:
                         self._cutoff = True
@@ -99,11 +130,15 @@ class SpaceTimeSearch:
                         heappush(self._heap, (candidate + self.heuristic(neighbor, self.goal),
                                              next(self._order), candidate, successor))
                         self.generated_states += 1
+                        if self.observe:
+                            opened.append(successor)
                         self.peak_frontier_size = max(self.peak_frontier_size, len(self._open))
                 break
             if not path and not self._open:
                 reason = "horizon_exhausted" if self._cutoff else "reservation_blocked"
         self._elapsed_ns += perf_counter_ns() - began
+        if self.observe:
+            self.last_observation = SearchObservation(expanded, tuple(opened), tuple(rejected))
         if path or reason:
             self.result = SpaceTimeResult(bool(path), path, len(path) - 1 if path else None,
                                           self.expanded_states, self.generated_states, self.peak_frontier_size,

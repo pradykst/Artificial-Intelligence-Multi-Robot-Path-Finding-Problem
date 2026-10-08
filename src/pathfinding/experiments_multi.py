@@ -11,7 +11,7 @@ from typing import Sequence
 
 from .agents import Agent, random_agents
 from .analysis_multi import (
-    FIXED, HARDNESS, IDENTITY, INDEPENDENT, PROPOSED, analysis_text, conflict_group,
+    FIXED, HARDNESS, IDENTITY, INDEPENDENT, NO_PROMOTION, PROPOSED, analysis_text, conflict_group,
     independent_hardness, paired_comparisons, summarize_adaptation, summarize_methods,
     summarize_pairs, validate_paired_rows,
 )
@@ -23,7 +23,7 @@ from .multi_agent import compute_metrics, independent_astar
 
 METRICS = ("total_collisions", "sum_of_costs", "makespan", "wait_actions", "elapsed_ms",
            "expanded_states", "generated_states", "peak_frontier_size", "cost_overhead_percent",
-           "planning_attempts", "priority_promotions")
+           "planning_attempts", "priority_promotions", "vertex_collisions", "edge_collisions", "failed_planning_attempts")
 
 
 @dataclass(frozen=True)
@@ -99,7 +99,7 @@ def run_algorithm(scenario: Scenario, algorithm: str, **limits) -> dict:
             "expanded_states": sum(plan.result.expanded_nodes for plan in plans),
             "generated_states": sum(plan.result.generated_nodes for plan in plans),
             "peak_frontier_size": max(plan.result.peak_frontier_size for plan in plans),
-            "planning_attempts": 1, "priority_promotions": 0,
+            "planning_attempts": 1, "priority_promotions": 0, "failed_planning_attempts": int(not found),
             "initial_priority_order": "[]", "final_priority_order": "[]", "attempted_orders": "[]",
             "conflict_load": "{}", "bottleneck_exposure": "{}", "conflict_graph": "{}",
             "independent_path_cost": json.dumps({plan.agent.agent_id: plan.result.path_cost for plan in plans}, sort_keys=True),
@@ -108,9 +108,12 @@ def run_algorithm(scenario: Scenario, algorithm: str, **limits) -> dict:
         }
         row.update(independent_hardness({plan.agent.agent_id: plan.path for plan in plans} if found else None))
         return row
-    if algorithm not in (FIXED, PROPOSED):
+    if algorithm not in (FIXED, NO_PROMOTION, PROPOSED):
         raise ValueError("Unknown benchmark algorithm.")
-    result = cooperative_plan(scenario.grid, scenario.agents, adaptive=algorithm == PROPOSED, **limits)
+    options = {"adaptive": algorithm == PROPOSED}
+    if algorithm == NO_PROMOTION:
+        options["initial_priority"] = "conflict"
+    result = cooperative_plan(scenario.grid, scenario.agents, **options, **limits)
     return {
         "individual_planning_success": result.individual_planning_success,
         "coordinated_planning_success": result.found, "collision_free": result.found,
@@ -120,6 +123,7 @@ def run_algorithm(scenario: Scenario, algorithm: str, **limits) -> dict:
         "expanded_states": result.expanded_states, "generated_states": result.generated_states,
         "peak_frontier_size": result.peak_frontier_size,
         "planning_attempts": result.planning_attempts, "priority_promotions": result.priority_promotions,
+        "failed_planning_attempts": result.planning_attempts - int(result.found),
         "initial_priority_order": json.dumps(result.initial_priority_order),
         "final_priority_order": json.dumps(result.final_priority_order), "attempted_orders": json.dumps(result.attempted_orders),
         "conflict_load": json.dumps(result.analysis.conflict_load, sort_keys=True),
@@ -132,10 +136,16 @@ def run_algorithm(scenario: Scenario, algorithm: str, **limits) -> dict:
     }
 
 
-def run_benchmark(scenarios: Sequence[Scenario], include_fixed: bool = False, **limits) -> list[dict]:
+def selected_algorithms(include_fixed: bool, include_no_promotion: bool = False) -> list[str]:
+    return [INDEPENDENT, *([FIXED] if include_fixed or include_no_promotion else []),
+            *([NO_PROMOTION] if include_no_promotion else []), PROPOSED]
+
+
+def run_benchmark(scenarios: Sequence[Scenario], include_fixed: bool = False,
+                  *, include_no_promotion: bool = False, **limits) -> list[dict]:
     if len({scenario.scenario_id for scenario in scenarios}) != len(scenarios):
         raise ValueError("Scenario IDs must be unique within a benchmark.")
-    algorithms = [INDEPENDENT, FIXED, PROPOSED] if include_fixed else [INDEPENDENT, PROPOSED]
+    algorithms = selected_algorithms(include_fixed, include_no_promotion)
     rows = []
     for index, scenario in enumerate(scenarios):
         offset = index % len(algorithms)
@@ -158,7 +168,7 @@ def run_benchmark(scenarios: Sequence[Scenario], include_fixed: bool = False, **
             row["cost_overhead_percent"] = ((cost - base_cost) / base_cost * 100
                                             if cost is not None and base_cost and baseline["individual_planning_success"] else None)
         rows.extend(paired)
-    validate_paired_rows(rows)
+    validate_paired_rows(rows, algorithms)
     return rows
 
 
@@ -229,7 +239,9 @@ def plot_results(summaries: Sequence[dict], output: Path) -> list[Path]:
                 axis.set_ylim(0, 105)
             axis.grid(alpha=0.25)
         axes[0, 0].legend(fontsize=8, loc="lower left")
-        fig.suptitle(f"{width} × {height}, obstacle probability {probability:g}\n"
+        trial_counts = sorted({row["scenario_count"] for row in group})
+        trial_text = ", ".join(str(count) for count in trial_counts)
+        fig.suptitle(f"{width} × {height}, obstacle probability {probability:g}, trials per method/agent count: {trial_text}\n"
                      "Solid = mean; dashed = median. Quality/collision averages exclude missing plans; success rates include failures.")
         path = output / f"comparison_{width}x{height}_p{probability:g}.png"
         fig.savefig(path, dpi=150)
@@ -239,12 +251,19 @@ def plot_results(summaries: Sequence[dict], output: Path) -> list[Path]:
 
 
 def save_results(scenarios: Sequence[Scenario], rows: Sequence[dict], output: Path, configuration: dict) -> list[Path]:
-    groups = validate_paired_rows(rows)
-    if set(groups) != {scenario.scenario_id for scenario in scenarios}:
+    if not scenarios or not rows:
+        raise ValueError("Provide nonempty scenarios and result rows.")
+    expected_algorithms = None
+    if "include_fixed" in configuration or "include_no_promotion" in configuration:
+        expected_algorithms = selected_algorithms(configuration.get("include_fixed", False), configuration.get("include_no_promotion", False))
+    groups = validate_paired_rows(rows, expected_algorithms)
+    scenario_ids = {scenario.scenario_id for scenario in scenarios}
+    if len(scenario_ids) != len(scenarios) or set(groups) != scenario_ids:
         raise ValueError("Result scenario IDs do not match the scenario manifest.")
     for scenario in scenarios:
         row = next(iter(groups[scenario.scenario_id].values()))
         expected = {"scenario_hash": scenario_hash(scenario), "seed": scenario.seed,
+                    "trial": scenario.trial, "generation_attempts": scenario.generation_attempts,
                     "width": scenario.grid.width, "height": scenario.grid.height,
                     "obstacle_probability": scenario.obstacle_probability, "number_of_agents": len(scenario.agents)}
         if any(row[field] != value for field, value in expected.items()):
@@ -255,6 +274,8 @@ def save_results(scenarios: Sequence[Scenario], rows: Sequence[dict], output: Pa
     write_csv(output / "summary.csv", summaries)
     manifest = {
         "configuration": configuration, "python": platform.python_version(), "platform": platform.platform(),
+        "seed_policy": "One global candidate seed counter from base_seed; increment after every draw, including rejections.",
+        "sampling_policy": "Conditional on distinct individually reachable endpoints; not filtered for joint success or collisions.",
         "rejected_generation_candidates": sum(scenario.generation_attempts - 1 for scenario in scenarios),
         "scenarios": [{"scenario_id": scenario.scenario_id, "seed": scenario.seed, "trial": scenario.trial,
                        "obstacle_probability": scenario.obstacle_probability, "generation_attempts": scenario.generation_attempts,
@@ -274,6 +295,15 @@ def save_results(scenarios: Sequence[Scenario], rows: Sequence[dict], output: Pa
     lines.extend(analysis_text(rows, pairs))
     (output / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     write_analysis_outputs(rows, pairs, output)
+    if any(row["algorithm"] == NO_PROMOTION for row in rows):
+        from .analysis_ablation import ablation_comparisons, ablation_text, summarize_ablation
+        from .final_plots import plot_q2
+
+        ablation = ablation_comparisons(rows)
+        write_csv(output / "ablation_comparisons.csv", ablation)
+        write_csv(output / "ablation_summary.csv", summarize_ablation(ablation))
+        (output / "ablation_summary.txt").write_text(ablation_text(ablation), encoding="utf-8")
+        return plot_q2(rows, output)
     return plot_results(summaries, output) + plot_analysis(rows, pairs, output)
 
 
@@ -306,6 +336,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--agents", type=int, nargs="+", default=[2, 4])
     parser.add_argument("--base-seed", type=int, default=42)
     parser.add_argument("--include-fixed", action="store_true")
+    parser.add_argument("--include-no-promotion", action="store_true", help="Experiment-only conflict-guided ordering without promotion")
     parser.add_argument("--max-horizon", type=int)
     parser.add_argument("--max-priority-retries", type=int)
     parser.add_argument("--max-expansions", type=int, default=100_000)
@@ -321,7 +352,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     except ValueError as error:
         parser.error(str(error))
     print(f"Planning {len(scenarios)} paired random scenarios...", flush=True)
-    rows = run_benchmark(scenarios, args.include_fixed, **limits)
+    rows = run_benchmark(scenarios, args.include_fixed, include_no_promotion=args.include_no_promotion, **limits)
     configuration = vars(args).copy()
     configuration["output"] = str(args.output)
     plots = save_results(scenarios, rows, args.output, configuration)

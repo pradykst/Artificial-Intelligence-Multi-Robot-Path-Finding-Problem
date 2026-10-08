@@ -1,10 +1,12 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .agents import Agent, random_agents
 from .astar import AStarSearch
 from .cooperative import CooperativePlanner
+from .decentralized import DCN, DecentralizedPlanner
 from .grid import Grid
 from .multi_agent import IndependentPlanner, Simulation
+from .planning_view import EventLog, PlanningSnapshot
 
 
 @dataclass
@@ -19,15 +21,21 @@ class DemoState:
     simulation: Simulation | None = None
     algorithm: str = "Independent A*"
     cooperative: CooperativePlanner | None = None
+    decentralized: DecentralizedPlanner | None = None
+    planning_snapshot: PlanningSnapshot | None = None
+    planning_log: EventLog = field(default_factory=EventLog)
 
     def reset(self) -> None:
         self.search = None
         self.planner = None
         self.simulation = None
         self.cooperative = None
+        self.decentralized = None
+        self.planning_snapshot = None
+        self.planning_log.clear()
 
     def set_algorithm(self, algorithm: str) -> None:
-        if algorithm not in ("Independent A*", "CG-ST-A*"):
+        if algorithm not in ("Independent A*", "CG-ST-A*", DCN):
             raise ValueError("Unknown multi-agent algorithm.")
         self.reset()
         self.algorithm = algorithm
